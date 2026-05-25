@@ -437,7 +437,7 @@ int main(int argc, char **argv) {
   printf("GPU Shared:\t%.2fx faster (%.2f ms)\n", durationCPU.count() / millisecondsShared, millisecondsShared);
   printf("GPU Separable:\t%.2fx faster (%.2f ms)\n", durationCPU.count() / millisecondsSeparable, millisecondsSeparable);
 
-  // Cleanup
+  // cleanup
   CHECK_CUDA_ERROR(cudaFree(d_input));
   CHECK_CUDA_ERROR(cudaFree(d_output));
   CHECK_CUDA_ERROR(cudaFree(d_intermediate));
