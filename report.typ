@@ -4,25 +4,27 @@
 #set heading(numbering: "1.")
 
 #align(center)[
-  #text(size: 18pt, weight: "bold")[Image Convolution Optimization with NVIDIA CUDA] \
+  #text(size: 18pt, weight: "bold")[Image Convolution Optimization in CUDA] \
   #v(1em)
-  #text(size: 12pt)[Performance Analysis and Optimization Report]
+  #text(size: 12pt)[Performance Analysis and Lab Report]
 ]
 
 #v(2em)
 
 = Implementation Approaches
 
-Image convolution is inherently parallelizable. Four distinct implementations were developed to explore the performance characteristics of CPU versus GPU execution:
+Since image convolution applies the exact same math to every pixel, it's a perfect fit for the GPU. For this assignment, I built four different versions to see how much performance I could squeeze out:
 
-- *CPU Baseline:* A sequential implementation utilizing standard nested loops to iterate over image height, width, and color channels. Edges were handled via clamping.
-- *GPU Naive:* A direct port of the CPU logic. Each thread in a 2D grid computes exactly one output pixel, reading filter weights from constant memory and pixel data directly from global memory.
-- *GPU Shared Memory:* A tiled approach utilizing a 16x16 thread block to collaboratively load an 18x18 "halo" tile into `__shared__` memory. This heavily reduces redundant global memory reads by caching neighboring pixels.
-- *GPU Separable (Two-Pass):* Exploiting the mathematical separability of a Gaussian blur, the $O(N^2)$ 2D convolution was split into two $O(N)$ 1D passes (horizontal, then vertical), significantly reducing the arithmetic workload.
+- *CPU Baseline:* A standard sequential C++ version using nested loops to go through the image's rows, columns, and color channels. I handled the edges by clamping the coordinates.
+- *GPU Naive:* A straight port of the CPU code to CUDA. Instead of looping over X and Y, I spawned a 2D grid of threads where each thread calculates exactly one pixel. The filter weights are stored in fast `__constant__` memory, but the pixel data is read directly from global memory.
+- *GPU Shared Memory:* To cut down on global memory reads, I wrote a tiled version. A 16x16 thread block collaboratively loads an 18x18 "halo" chunk of the image into `__shared__` memory, syncs up, and then calculates the convolution.
+- *GPU Separable (Two-Pass):* Using a math trick for Gaussian blurs, I broke the 2D filter into two 1D passes. It reads the rows horizontally, saves to an intermediate array, and then reads the columns vertically. This drops the workload from $O(N^2)$ to $O(2N)$.
 
 = Performance Analysis and Charting
 
-The following benchmarks were recorded using a 4000x2407 pixel image (3 channels) with a 5x5 filter. The CPU baseline completed in *6266.30 ms*. Due to the extreme difference in execution time, the chart below focuses exclusively on GPU kernel performance.
+I tested all my implementations on a large 4K image (4000x2407, 3 channels) using a 5x5 Gaussian filter.
+
+The CPU baseline took a massive *6266.30 ms* to finish. Because the CPU was so slow, I left it off the chart below so the GPU times would actually be readable on a normal scale.
 
 #figure(
   align(center)[
@@ -38,7 +40,7 @@ The following benchmarks were recorded using a 4000x2407 pixel image (3 channels
           columns: (100pt, 40pt, 1fr),
           align: (right, center, left),
           row-gutter: 12pt,
-          
+
           [*Uncoalesced*], [6.97 ms], [#rect(width: 6.97 * 25pt, height: 12pt, fill: rgb("E63946"))],
           [*Shared*], [2.20 ms], [#rect(width: 2.20 * 25pt, height: 12pt, fill: rgb("457B9D"))],
           [*Naive*], [2.14 ms], [#rect(width: 2.14 * 25pt, height: 12pt, fill: rgb("1D3557"))],
@@ -47,33 +49,33 @@ The following benchmarks were recorded using a 4000x2407 pixel image (3 channels
       ],
     )
   ],
-  caption: [Performance comparison of CUDA implementations. Shorter bars indicate faster execution.],
+  caption: [Comparison of my custom CUDA kernels. Shorter bars equal faster execution.],
 )
 
 = Memory Access Optimizations
 
-== Coalesced and Unaligned Memory
-Proper memory alignment is critical for GPU performance. In the standard kernels, the `threadIdx.x` dimension was mapped to the image width. This allowed warps (groups of 32 threads) to request contiguous memory blocks, resulting in perfectly coalesced reads. To test the impact of this, a deliberately uncoalesced kernel was written where the axes were flipped (mapping `threadIdx.x` to the Y-axis).
-As shown in the chart above, the uncoalesced kernel execution time spiked to *6.97 ms*, performing more than 3x slower than the correctly coalesced naive kernel (2.14 ms), despite executing the exact same arithmetic.
+== Coalesced vs. Unaligned Memory
+To get good performance on a GPU, memory reads need to be coalesced. By mapping `threadIdx.x` to the image's X-axis, my threads grab contiguous blocks of memory at the same time. To prove how important this is, I intentionally wrote a "bad" kernel where I flipped the axes, forcing the threads to read vertically and breaking the memory alignment.
+Looking at the chart, the uncoalesced kernel took *6.97 ms*—over 3 times slower than the standard Naive kernel (2.14 ms), even though it does the exact same amount of math.
 
-== Bank Conflicts and Padding
-Shared memory is organized into 32 banks. To prevent bank conflicts when threads access data vertically within the shared memory tile, the array was padded by adding an extra column `[SHARED_WIDTH + 1]`. This shifts the alignment of each subsequent row, ensuring that vertical neighbors reside in different memory banks.
+== Avoiding Bank Conflicts
+Shared memory is broken up into 32 banks. If multiple threads try to read vertically, they can hit the same bank and cause a bottleneck. To prevent this, I padded the shared memory array by adding an extra column `[SHARED_WIDTH + 1]`. This shifts the memory layout so that vertical neighbors end up in different banks.
 
 = Filter Dimension Impact
 
-The performance characteristics of the kernels shift dramatically depending on the size of the convolution filter:
-- *5x5 Filter:* The Naive kernel (2.14 ms) slightly outperformed the Shared Memory kernel (2.20 ms). Modern GPU architectures feature large L1/L2 caches that automatically optimize overlapping global memory reads for small filters. The overhead of collaborative loading and integer arithmetic (`%` and `/`) in the shared memory kernel outweighed the caching benefits.
-- *9x9 Filter:* When the workload was increased to a 9x9 box blur (81 reads per pixel), the Shared Memory kernel (5.51 ms) overtook the Naive kernel (5.76 ms). As filter size grows, the $N^2$ memory reuse heavily favors the explicitly managed `__shared__` cache.
+One of the most interesting things I noticed was how changing the filter size completely changes which kernel is the fastest:
+- *With a 5x5 Filter:* I was surprised to see the Naive kernel (2.14 ms) actually beat the Shared Memory kernel (2.20 ms). Modern GPUs have excellent L1/L2 caches, so for a small filter, the hardware handles the overlapping reads automatically. The time it took my Shared kernel to do the integer division math (`/` and `%`) for the tile coordinates ended up outweighing the memory savings.
+- *With a 9x9 Filter:* When I cranked the workload up to a 9x9 filter (81 memory reads per pixel), the Shared Memory kernel finally overtook the Naive one (5.51 ms vs 5.76 ms). Because the memory reuse is so much higher, the `__shared__` cache advantage finally beats the math overhead.
 
 = Profiling with Nsight Systems
 
-A profile generated using `nsys` identified several key system bottlenecks:
-1. *Memory Bandwidth:* The uncoalesced kernel consumed 56.1% of the total recorded GPU compute time, proving that poor memory alignment causes a severe bandwidth bottleneck as the hardware fails to merge transactions.
-2. *Compute and Transfer:* The `cuda_api_sum` report revealed that memory allocation (`cudaMalloc`) and host-to-device transfers (`cudaMemcpy`) heavily dominated the application's overall lifecycle. The actual separated kernel executions took ~0.57 ms each, while `cudaMemcpy` operations consumed millions of nanoseconds. Once the compute kernels are fully optimized, PCIe transfer speeds become the ultimate system bottleneck.
+I ran `nsys profile` on the remote server to see what was actually bottlenecking the program under the hood:
+1. *Memory Bandwidth:* The profile showed the uncoalesced kernel eating up 56.1% of the GPU's compute time. Because the memory reads weren't aligned, the hardware couldn't merge the transactions, creating a massive memory bandwidth bottleneck.
+2. *PCIe Transfer Overheads:* Looking at the `cuda_api_sum` report, it turns out the actual math isn't the bottleneck anymore. My kernels take barely over a millisecond, but the `cudaMemcpy` calls take significantly longer. Now that the kernels are optimized, just copying the 4K image back and forth over the PCIe bus is taking up the majority of the application's time.
 
-= Suggested Further Optimizations
+= Future Optimizations
 
-While the Separable Filter provides excellent performance (over 5000x faster than the CPU), further optimizations could include:
-1. *Loop Unrolling:* Applying `#pragma unroll` to the inner filter loops to eliminate loop-control overhead at the compiler level.
-2. *Warp Shuffle Instructions:* Replacing the `__shared__` memory implementation with `__shfl_sync()` intrinsics. This allows threads within the same warp to share data directly via registers, eliminating shared memory latency and the risk of bank conflicts entirely.
-3. *Increased Thread Granularity:* Modifying the kernel so that each thread computes 2 or 4 pixels instead of 1. This increases instruction-level parallelism and better hides memory fetch latency.
+Even though my Separable filter implementation runs over 5,300x faster than my CPU baseline, there are a few more things I could do if I had more time:
+1. *Loop Unrolling:* I could add `#pragma unroll` to the inner filter loops to get rid of the loop-control overhead at compile time.
+2. *Warp Shuffles:* Instead of using `__shared__` memory at all, I could use `__shfl_sync()` to pass pixel data directly between threads in the same warp using registers.
+3. *Process More Pixels per Thread:* Right now, one thread handles one pixel. If I changed it so each thread handles 2 or 4 pixels, it would increase instruction-level parallelism and hide the memory fetch latency a lot better.
